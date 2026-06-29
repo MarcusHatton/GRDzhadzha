@@ -25,4 +25,7 @@ time.table.*
 *.log
 ipo_out.optrpt
 
+Examples/*/output*/
+Tests/*/output*/
+
 Doxygen/html
