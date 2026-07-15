@@ -33,14 +33,14 @@ namespace
 {
 struct SimulationConfig
 {
-    int num_cells = 96;
-    int num_z_cells = 9;
+    int num_cells = 64;
+    int num_z_cells = 13;
     int num_ghosts = 2;
-    double domain_length = 72.0;
+    double domain_length = 32.0;
     double final_time = 10.0;
     double output_interval = 0.1;
-    double cfl = 0.16;
-    double max_dt = 0.04;
+    double cfl = 0.14;
+    double max_dt = 0.02;
 
     double mass_1 = 0.5;
     double mass_2 = 0.5;
@@ -51,17 +51,19 @@ struct SimulationConfig
     double softening_radius = 0.75;
     double metric_time_derivative_step = 1.0e-3;
 
-    double mini_disk_inner_radius = 1.35;
-    double mini_disk_peak_radius = 2.7;
-    double mini_disk_outer_radius = 4.15;
-    double mini_disk_radial_width = 0.65;
-    double mini_disk_vertical_width = 0.75;
+    double mini_disk_inner_radius = 1.6;
+    double mini_disk_peak_radius = 2.4;
+    double mini_disk_outer_radius = 3.25;
+    double mini_disk_radial_width = 0.45;
+    double mini_disk_vertical_width = 0.55;
     double rho_peak = 4.0e-5;
-    double pressure_over_density = 2.5e-3;
-    double orbital_velocity_factor = 0.86;
+    double pressure_over_density = 8.0e-4;
+    double orbital_velocity_factor = 0.64;
+    double matched_atmosphere_width = 0.0;
+    double matched_atmosphere_density_factor = 1.0;
 
     double rho_floor = 1.0e-10;
-    double pressure_floor = 1.0e-12;
+    double pressure_floor = 8.0e-14;
     double max_velocity_squared = 0.72;
     double limiter_theta = 1.3;
     bool use_reconstruction = true;
@@ -99,6 +101,15 @@ struct DiskCandidate
     double rho = 0.0;
     double radius = 0.0;
     std::array<double, CH_SPACEDIM> relative_position;
+};
+
+struct MiniDiskEquilibrium
+{
+    std::array<double, 2> ell;
+    std::array<double, 2> peak_potential;
+    std::array<double, 2> surface_potential;
+    std::array<double, 2> pressure_over_density;
+    double density_exponent = 1.5;
 };
 
 struct Diagnostics
@@ -166,11 +177,14 @@ double parse_positive_double(const char *text, const std::string &name)
 SimulationConfig make_config_from_args(int argc, char *argv[])
 {
     SimulationConfig config;
-    if (argc > 2)
+    if (argc > 3)
         throw std::runtime_error(
-            "usage: Main_GRHDLevelDataBinaryPNMiniDisks [final_time]");
-    if (argc == 2)
+            "usage: Main_GRHDLevelDataBinaryPNMiniDisks [final_time [orbital_velocity_factor]]");
+    if (argc >= 2)
         config.final_time = parse_positive_double(argv[1], "final_time");
+    if (argc == 3)
+        config.orbital_velocity_factor =
+            parse_positive_double(argv[2], "orbital_velocity_factor");
     return config;
 }
 
@@ -316,9 +330,160 @@ BinaryState make_binary_state(const SimulationConfig &config, double time)
     return state;
 }
 
+double binary_roche_potential(
+    const std::array<double, CH_SPACEDIM> &position,
+    const BinaryState &binary, const SimulationConfig &config)
+{
+    double potential =
+        -0.5 * binary.omega * binary.omega *
+        (position[0] * position[0] + position[1] * position[1]);
+    for (int body = 0; body < 2; ++body)
+    {
+        double radius_squared =
+            config.softening_radius * config.softening_radius;
+        FOR(dir)
+        {
+            const double displacement =
+                position[dir] - binary.position[body][dir];
+            radius_squared += displacement * displacement;
+        }
+        potential -= binary.mass[body] / std::sqrt(radius_squared);
+    }
+    return potential;
+}
+
+std::array<double, CH_SPACEDIM> body_radial_unit(
+    const BinaryState &binary, int body)
+{
+    std::array<double, CH_SPACEDIM> unit = {{1.0, 0.0, 0.0}};
+    const double radius = std::sqrt(
+        binary.position[body][0] * binary.position[body][0] +
+        binary.position[body][1] * binary.position[body][1]);
+    if (radius > 1.0e-14)
+    {
+        unit[0] = binary.position[body][0] / radius;
+        unit[1] = binary.position[body][1] / radius;
+    }
+    return unit;
+}
+
+std::array<double, CH_SPACEDIM> body_tangent_unit(
+    const std::array<double, CH_SPACEDIM> &radial_unit)
+{
+    return {{-radial_unit[1], radial_unit[0], 0.0}};
+}
+
+double mini_disk_specific_angular_momentum(
+    const BinaryState &binary, const SimulationConfig &config, int body)
+{
+    const double radius = config.mini_disk_peak_radius;
+    const double radius_squared = radius * radius;
+    const double softened_radius_squared =
+        radius_squared + config.softening_radius * config.softening_radius;
+    const double ell_squared =
+        binary.mass[body] * radius_squared * radius_squared /
+        std::pow(softened_radius_squared, 1.5);
+    return config.orbital_velocity_factor *
+           std::sqrt(std::max(0.0, ell_squared));
+}
+
+double mini_disk_effective_potential(
+    const std::array<double, CH_SPACEDIM> &position,
+    const BinaryState &binary, const SimulationConfig &config, int body,
+    double ell)
+{
+    const double dx = position[0] - binary.position[body][0];
+    const double dy = position[1] - binary.position[body][1];
+    const double radius_squared = dx * dx + dy * dy;
+    if (radius_squared <= 1.0e-14)
+        return std::numeric_limits<double>::infinity();
+    return binary_roche_potential(position, binary, config) +
+           0.5 * ell * ell / radius_squared;
+}
+
+std::array<double, CH_SPACEDIM> body_ring_position(
+    const BinaryState &binary, int body, double radius, double angle)
+{
+    const auto radial = body_radial_unit(binary, body);
+    const auto tangent = body_tangent_unit(radial);
+    const double cos_angle = std::cos(angle);
+    const double sin_angle = std::sin(angle);
+    std::array<double, CH_SPACEDIM> position = binary.position[body];
+    FOR(dir)
+    {
+        position[dir] +=
+            radius * (cos_angle * radial[dir] + sin_angle * tangent[dir]);
+    }
+    return position;
+}
+
+double sample_mini_disk_ring_min_potential(
+    const BinaryState &binary, const SimulationConfig &config, int body,
+    double radius, double ell)
+{
+    constexpr int num_samples = 96;
+    const double two_pi = 8.0 * std::atan(1.0);
+    double min_potential = std::numeric_limits<double>::infinity();
+    for (int sample = 0; sample < num_samples; ++sample)
+    {
+        const double angle =
+            two_pi * static_cast<double>(sample) /
+            static_cast<double>(num_samples);
+        const auto position = body_ring_position(binary, body, radius, angle);
+        min_potential = std::min(
+            min_potential,
+            mini_disk_effective_potential(position, binary, config, body,
+                                          ell));
+    }
+    return min_potential;
+}
+
+template <class eos_t>
+MiniDiskEquilibrium make_mini_disk_equilibrium(
+    const BinaryState &binary, const SimulationConfig &config,
+    const eos_t &eos)
+{
+    MiniDiskEquilibrium equilibrium;
+    const double gamma = eos.adiabatic_index();
+    equilibrium.density_exponent = 1.0 / (gamma - 1.0);
+
+    for (int body = 0; body < 2; ++body)
+    {
+        equilibrium.ell[body] =
+            mini_disk_specific_angular_momentum(binary, config, body);
+        equilibrium.peak_potential[body] =
+            sample_mini_disk_ring_min_potential(
+                binary, config, body, config.mini_disk_peak_radius,
+                equilibrium.ell[body]);
+        const double inner_surface = sample_mini_disk_ring_min_potential(
+            binary, config, body, config.mini_disk_inner_radius,
+            equilibrium.ell[body]);
+        const double outer_surface = sample_mini_disk_ring_min_potential(
+            binary, config, body, config.mini_disk_outer_radius,
+            equilibrium.ell[body]);
+        equilibrium.surface_potential[body] =
+            std::min(inner_surface, outer_surface);
+
+        if (!std::isfinite(equilibrium.peak_potential[body]) ||
+            !std::isfinite(equilibrium.surface_potential[body]) ||
+            equilibrium.surface_potential[body] <=
+                equilibrium.peak_potential[body])
+        {
+            equilibrium.surface_potential[body] =
+                equilibrium.peak_potential[body] + 1.0e-8;
+        }
+
+        equilibrium.pressure_over_density[body] =
+            std::max(config.pressure_floor / config.rho_peak,
+                     config.pressure_over_density);
+    }
+    return equilibrium;
+}
+
 DiskCandidate mini_disk_candidate(
     const std::array<double, CH_SPACEDIM> &position,
-    const BinaryState &binary, const SimulationConfig &config, int body)
+    const BinaryState &binary, const SimulationConfig &config,
+    const MiniDiskEquilibrium &equilibrium, int body)
 {
     DiskCandidate candidate;
     candidate.index = body;
@@ -334,57 +499,91 @@ DiskCandidate mini_disk_candidate(
         candidate.radius > config.mini_disk_outer_radius)
         return candidate;
 
-    const double radial_offset =
-        (candidate.radius - config.mini_disk_peak_radius) /
-        config.mini_disk_radial_width;
-    const double vertical_offset =
-        candidate.relative_position[2] / config.mini_disk_vertical_width;
-    const double radial_profile = std::exp(-0.5 * radial_offset * radial_offset);
-    const double vertical_profile =
-        std::exp(-0.5 * vertical_offset * vertical_offset);
+    const double potential = mini_disk_effective_potential(
+        position, binary, config, body, equilibrium.ell[body]);
+    const double potential_depth =
+        equilibrium.surface_potential[body] -
+        equilibrium.peak_potential[body];
+    if (!std::isfinite(potential) || potential_depth <= 0.0 ||
+        potential >= equilibrium.surface_potential[body])
+        return candidate;
 
-    const double inner_taper = std::min(
+    const double normalized_depth = std::min(
         1.0, std::max(0.0,
-                      (candidate.radius - config.mini_disk_inner_radius) /
-                          (config.mini_disk_peak_radius -
-                           config.mini_disk_inner_radius)));
-    const double outer_taper = std::min(
-        1.0, std::max(0.0,
-                      (config.mini_disk_outer_radius - candidate.radius) /
-                          (config.mini_disk_outer_radius -
-                           config.mini_disk_peak_radius)));
-    const double taper = inner_taper * inner_taper * (3.0 - 2.0 * inner_taper) *
-                         outer_taper * outer_taper * (3.0 - 2.0 * outer_taper);
-    candidate.rho = config.rho_peak * radial_profile * vertical_profile * taper;
+                      (equilibrium.surface_potential[body] - potential) /
+                          potential_depth));
+    candidate.rho =
+        config.rho_peak *
+        std::pow(normalized_depth, equilibrium.density_exponent);
     candidate.active = candidate.rho > 20.0 * config.rho_floor;
     return candidate;
 }
 
 DiskCandidate select_mini_disk(
     const std::array<double, CH_SPACEDIM> &position,
+    const BinaryState &binary, const SimulationConfig &config,
+    const MiniDiskEquilibrium &equilibrium)
+{
+    const DiskCandidate first =
+        mini_disk_candidate(position, binary, config, equilibrium, 0);
+    const DiskCandidate second =
+        mini_disk_candidate(position, binary, config, equilibrium, 1);
+    if (first.rho >= second.rho)
+        return first;
+    return second;
+}
+
+DiskCandidate matched_atmosphere_candidate(
+    const std::array<double, CH_SPACEDIM> &position,
+    const BinaryState &binary, const SimulationConfig &config, int body)
+{
+    DiskCandidate candidate;
+    candidate.index = body;
+    if (config.matched_atmosphere_width <= 0.0)
+        return candidate;
+    FOR(dir)
+    {
+        candidate.relative_position[dir] =
+            position[dir] - binary.position[body][dir];
+    }
+    candidate.radius = std::sqrt(
+        candidate.relative_position[0] * candidate.relative_position[0] +
+        candidate.relative_position[1] * candidate.relative_position[1]);
+
+    const double inner_radius = config.mini_disk_inner_radius;
+    const double outer_radius =
+        config.mini_disk_outer_radius + config.matched_atmosphere_width;
+    candidate.active = candidate.radius >= inner_radius &&
+                       candidate.radius <= outer_radius;
+    return candidate;
+}
+
+DiskCandidate select_matched_atmosphere(
+    const std::array<double, CH_SPACEDIM> &position,
     const BinaryState &binary, const SimulationConfig &config)
 {
-    const DiskCandidate first = mini_disk_candidate(position, binary, config, 0);
-    const DiskCandidate second = mini_disk_candidate(position, binary, config, 1);
-    if (first.rho >= second.rho)
+    const DiskCandidate first =
+        matched_atmosphere_candidate(position, binary, config, 0);
+    const DiskCandidate second =
+        matched_atmosphere_candidate(position, binary, config, 1);
+    if (!second.active ||
+        (first.active && first.radius <= second.radius))
         return first;
     return second;
 }
 
 Tensor<1, double> eulerian_velocity_for_mini_disk(
     const DiskCandidate &disk, const BinaryState &binary,
-    const SimulationConfig &config, const GRHD::CellGeometry &geometry)
+    const SimulationConfig &config, const MiniDiskEquilibrium &equilibrium,
+    const GRHD::CellGeometry &geometry)
 {
     Tensor<1, double> coordinate_velocity;
     FOR(dir) { coordinate_velocity[dir] = binary.velocity[disk.index][dir]; }
 
-    const double softened_radius_squared =
-        disk.radius * disk.radius +
-        config.softening_radius * config.softening_radius;
+    const double radius_squared =
+        std::max(disk.radius * disk.radius, 1.0e-14);
     const double local_omega =
-        config.orbital_velocity_factor *
-        std::sqrt(binary.mass[disk.index] /
-                  (softened_radius_squared * std::sqrt(softened_radius_squared)));
+        equilibrium.ell[disk.index] / radius_squared;
     coordinate_velocity[0] += -local_omega * disk.relative_position[1];
     coordinate_velocity[1] += local_omega * disk.relative_position[0];
 
@@ -413,22 +612,47 @@ GRHD::Primitive<double> mini_disk_primitive(
     const std::array<double, CH_SPACEDIM> &position,
     const BinaryState &binary, const SimulationConfig &config,
     const eos_t &eos, const GRHD::CellGeometry &geometry,
-    const GRHD::AtmosphereOptions &atmosphere)
+    const GRHD::AtmosphereOptions &atmosphere,
+    const MiniDiskEquilibrium &equilibrium)
 {
     GRHD::Primitive<double> primitive =
         GRHD::make_atmosphere_primitive<double>(eos, atmosphere);
-    const DiskCandidate disk = select_mini_disk(position, binary, config);
+    const DiskCandidate disk =
+        select_mini_disk(position, binary, config, equilibrium);
     if (!disk.active)
+    {
+        const DiskCandidate atmosphere_disk =
+            select_matched_atmosphere(position, binary, config);
+        if (!atmosphere_disk.active)
+            return primitive;
+
+        primitive.rho = std::max(
+            atmosphere.rho_floor,
+            config.matched_atmosphere_density_factor * atmosphere.rho_floor);
+        primitive.pressure = std::max(
+            atmosphere.pressure_floor,
+            config.pressure_over_density * primitive.rho);
+        primitive.eps = primitive.pressure /
+                        ((eos.adiabatic_index() - 1.0) * primitive.rho);
+        primitive.velocity_U = eulerian_velocity_for_mini_disk(
+            atmosphere_disk, binary, config, equilibrium, geometry);
+        GRHD::enforce_primitive_floors(
+            primitive, eos, geometry.spatial_metric_LL, atmosphere);
         return primitive;
+    }
 
     primitive.rho = disk.rho;
-    primitive.pressure =
-        std::max(config.pressure_floor,
-                 config.pressure_over_density * primitive.rho);
+    const double density_fraction =
+        std::max(0.0, primitive.rho / config.rho_peak);
+    primitive.pressure = std::max(
+        config.pressure_floor,
+        equilibrium.pressure_over_density[disk.index] * config.rho_peak *
+            std::pow(density_fraction, eos.adiabatic_index()));
     primitive.eps =
         primitive.pressure / ((eos.adiabatic_index() - 1.0) * primitive.rho);
     primitive.velocity_U =
-        eulerian_velocity_for_mini_disk(disk, binary, config, geometry);
+        eulerian_velocity_for_mini_disk(disk, binary, config, equilibrium,
+                                       geometry);
 
     GRHD::enforce_primitive_floors(primitive, eos,
                                    geometry.spatial_metric_LL, atmosphere);
@@ -445,6 +669,8 @@ void fill_mini_disk_level_data(
 {
     const auto background = background_factory(time);
     const BinaryState binary = make_binary_state(config, time);
+    const MiniDiskEquilibrium equilibrium =
+        make_mini_disk_equilibrium(binary, config, eos);
     const DisjointBoxLayout &grids = state.disjointBoxLayout();
     DataIterator dit = grids.dataIterator();
     for (dit.begin(); dit.ok(); ++dit)
@@ -460,7 +686,8 @@ void fill_mini_disk_level_data(
             const auto geometry = GRHD::load_fixed_background_geometry(
                 background, iv, dx, center);
             const auto primitive = mini_disk_primitive(
-                position, binary, config, eos, geometry, atmosphere);
+                position, binary, config, eos, geometry, atmosphere,
+                equilibrium);
             GRHD::store_primitive(state[dit], iv, primitive);
             GRHD::store_conserved(
                 state[dit], iv,
@@ -799,7 +1026,7 @@ void write_summary(const std::string &path, const SimulationConfig &config,
         throw std::runtime_error("could not open " + path);
     out << std::setprecision(17);
     out << "driver GRHDLevelDataBinaryPNMiniDisks\n";
-    out << "method fixed_grdzhadzha_circular_binary_pn_leveldata_two_gaussian_minidisks_muscl_hlle_ssprk2\n";
+    out << "method fixed_grdzhadzha_circular_binary_pn_leveldata_two_effective_potential_minidisks_muscl_hlle_ssprk2\n";
     out << "num_cells " << config.num_cells << '\n';
     out << "num_z_cells " << config.num_z_cells << '\n';
     out << "num_boxes " << num_boxes << '\n';
@@ -828,6 +1055,10 @@ void write_summary(const std::string &path, const SimulationConfig &config,
     out << "pressure_over_density " << config.pressure_over_density << '\n';
     out << "orbital_velocity_factor " << config.orbital_velocity_factor
         << '\n';
+    out << "matched_atmosphere_width "
+        << config.matched_atmosphere_width << '\n';
+    out << "matched_atmosphere_density_factor "
+        << config.matched_atmosphere_density_factor << '\n';
     out << "initial_mass " << initial_diagnostics.mass << '\n';
     out << "final_mass " << final_diagnostics.mass << '\n';
     out << "relative_mass_change "
